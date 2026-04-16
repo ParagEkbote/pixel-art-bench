@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixel-art-bench"
+version = "0.1.0"
+description = "Pixel Art Benchmark using Inspect AI Eval Framework"
+readme = "README.md"
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Parag Ekbote" }
+]
+
+dependencies = [
+    "inspect-ai",
+    "huggingface_hub>=0.23",
+    "transformers",
+    "accelerate",
+    "pyyaml",
+    "matplotlib"
+]
+
+# Optional extras for dev / experimentation
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff"
+]
+
+# CLI entrypoints (optional but useful)
+[project.scripts]
+pixel-bench-export = "export.export_results:main"
+pixel-bench-plot = "plots.plot_from_hf:main"
+
+# ---------------- SETUPTOOLS ----------------
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eval*", "export*", "plots*"]
+
+# ---------------- TOOLING ----------------
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]
