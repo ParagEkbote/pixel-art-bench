@@ -1,0 +1,20 @@
+name: Pixel Art Bench
+description: >
+  Evaluates structured pixel-art generation (24x24 JSON grids).
+evaluation_framework: inspect-ai
+
+tasks:
+  - id: pixel_art_generation
+    config: default
+    split: train
+    field_spec:
+      input: prompt
+      target: subject
+      id: id
+    scorers:
+      - name: json_validity
+        type: python
+      - name: render_success
+        type: python
+      - name: pixel_art_quality
+        type: model_graded_fact
