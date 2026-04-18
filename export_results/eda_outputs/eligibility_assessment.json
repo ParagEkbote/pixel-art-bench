@@ -1,0 +1,46 @@
+{
+  "eligibility_scores": {
+    "sequence_length": {
+      "value": 605.0,
+      "score": 39.5,
+      "rationale": "P90 sequence length: 605. Fine-tuning prefers < 1000 tokens."
+    },
+    "dataset_size": {
+      "value": 1514,
+      "score": 100,
+      "rationale": "Valid samples: 1514. Fine-tuning needs \u2265500 for meaningful signal."
+    },
+    "data_quality": {
+      "value": 0.9038805970149254,
+      "score": 90.38805970149254,
+      "rationale": "Valid ratio: 90.39%. Threshold: \u226595%."
+    },
+    "pattern_complexity": {
+      "value": 1.4258453381728302,
+      "score": 50,
+      "rationale": "Entropy: 1.43. Optimal range: 1.5\u20133.5 for fine-tuning."
+    },
+    "color_diversity": {
+      "value": 0.8282107654016168,
+      "score": 82.82107654016167,
+      "rationale": "Avg color utilization: 82.82%. Higher is better for generalization."
+    },
+    "sparsity": {
+      "value": 0.6148593455344114,
+      "score": 100,
+      "rationale": "Sparsity: 61.49%. Moderate (0.3\u20130.8) is ideal."
+    },
+    "overall_score": 76.75971959431467
+  },
+  "recommendation": {
+    "tier": "ELIGIBLE FOR FINE-TUNING",
+    "confidence": "High",
+    "approach": "Direct fine-tuning (LoRA/QLoRA on LM models)",
+    "models": [
+      "Qwen2.5-1B",
+      "SmolLM2-1.7B",
+      "Llama-3.2-1B-Instruct"
+    ],
+    "note": "Dataset is well-structured. Use supervised fine-tuning with standard LM objectives."
+  }
+}
