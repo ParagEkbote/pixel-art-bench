@@ -1,4 +1,5 @@
 import json
+import re
 import torch
 import numpy as np
 import pandas as pd
@@ -7,193 +8,210 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
-# ==========================================
-# 1. Setup
-# ==========================================
 MODEL_NAME = "Qwen/Qwen3-1.7B"
 LORA_PATH = "./qwen-pixel-art-lora"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 base_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.bfloat16,
-    device_map="auto"
+    MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto"
 )
-
 lora_model = AutoModelForCausalLM.from_pretrained(
-    LORA_PATH,
-    torch_dtype=torch.bfloat16,
-    device_map="auto"
+    LORA_PATH, torch_dtype=torch.bfloat16, device_map="auto"
 )
 
-dataset = load_dataset("AINovice2005/pixel-art-bench-v1")["train"]
-dataset = dataset.select(range(200))  # eval subset
+# compile
+for m in (base_model, lora_model):
+    m.eval()
+    m = torch.compile(m, mode="reduce-overhead", fullgraph=False)
 
-# ==========================================
-# 2. Prompt
-# ==========================================
-def build_prompt(example):
-    return f"""Draw pixel art on a 24x24 grid. Return JSON with:
-- palette: list of hex colors (no #)
-- grid: 24 strings of length 24 (digits 0-9)
-Output ONLY JSON.
+dataset = load_dataset("AINovice2005/pixel-art-bench-v1")["train"].select(range(50))
 
-Draw: {example['example_name']}"""
+# -------------------------------
+# Prompt (chat-aligned)
+# -------------------------------
+def build_messages(example):
+    return [
+        {"role": "user",
+         "content": (
+            "Draw pixel art on a 24x24 grid. Return JSON with:\n"
+            "- palette: list of hex colors (no #)\n"
+            "- grid: 24 strings of length 24 (digits 0-9)\n"
+            "Output ONLY JSON.\n\n"
+            f"Draw: {example['example_name']}"
+         )}
+    ]
 
-# ==========================================
-# 3. Generation
-# ==========================================
-def generate(model, prompt):
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+# -------------------------------
+# Reasoning suppression
+# -------------------------------
+def get_bad_words_ids(tokenizer):
+    # block tokens that start reasoning
+    bad = ["<think>", "</think>"]
+    ids = []
+    for s in bad:
+        toks = tokenizer.encode(s, add_special_tokens=False)
+        if len(toks) > 0:
+            ids.append(toks)
+    return ids
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=800,
-        temperature=0.7,
-        top_p=0.9
+BAD_WORDS = get_bad_words_ids(tokenizer)
+
+# -------------------------------
+# Cleanup + extraction
+# -------------------------------
+THINK_BLOCK = re.compile(r"<think>.*?(</think>|$)", re.DOTALL)
+
+def strip_reasoning(text: str) -> str:
+    text = THINK_BLOCK.sub("", text)
+    text = text.replace("```json", "").replace("```", "")
+    return text.strip()
+
+def extract_json(text: str) -> str:
+    text = strip_reasoning(text)
+    start = text.find("{")
+    if start == -1:
+        return ""
+    text = text[start:]
+    # balance braces (handles truncation)
+    ob = text.count("{")
+    cb = text.count("}")
+    if cb < ob:
+        text = text + "}" * (ob - cb)
+    try:
+        json.loads(text)
+        return text
+    except:
+        return ""
+
+# -------------------------------
+# Generation
+# -------------------------------
+def generate(model, example):
+    messages = build_messages(example)
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
     )
 
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    input_len = inputs["input_ids"].shape[1]
 
-# ==========================================
-# 4. Metrics
-# ==========================================
-def json_validity(output):
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=1024,
+            do_sample=False,
+            use_cache=True,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            bad_words_ids=BAD_WORDS  # block <think>
+        )
+
+    gen = out[0][input_len:]
+    raw = tokenizer.decode(gen, skip_special_tokens=True)
+    js = extract_json(raw)
+    return js, raw
+
+# -------------------------------
+# Metrics
+# -------------------------------
+def json_validity(s):
     try:
-        json.loads(output)
+        json.loads(s); return 1.0
+    except: return 0.0
+
+def render_success(s):
+    try:
+        d = json.loads(s)
+        g = d.get("grid", [])
+        if not isinstance(g, list) or len(g) != 24: return 0.0
+        for r in g:
+            if not isinstance(r, str) or len(r) != 24: return 0.0
+            if not all(ch.isdigit() for ch in r): return 0.0
         return 1.0
     except:
         return 0.0
 
-def render_success(output):
+def pixel_art_quality(s):
     try:
-        data = json.loads(output)
-        grid = data.get("grid", [])
-
-        if not isinstance(grid, list) or len(grid) != 24:
-            return 0.0
-
-        for row in grid:
-            if not isinstance(row, str) or len(row) != 24:
-                return 0.0
-            if not all(ch.isdigit() and 0 <= int(ch) <= 9 for ch in row):
-                return 0.0
-
-        return 1.0
-    except:
-        return 0.0
-
-def pixel_art_quality(output):
-    try:
-        data = json.loads(output)
-        grid = data.get("grid", [])
-
-        if not grid:
-            return 0.0
-
-        pixels = [int(ch) for row in grid for ch in row]
-        unique_colors = len(set(pixels))
-
-        diversity = min(unique_colors / 10.0, 1.0)
-
-        counts = np.bincount(pixels, minlength=10)
-        dominant_ratio = counts.max() / len(pixels)
-
-        balance = 1.0 - dominant_ratio
-
+        d = json.loads(s)
+        g = d.get("grid", [])
+        if not g: return 0.0
+        px = [int(ch) for row in g for ch in row]
+        uniq = len(set(px))
+        diversity = min(uniq / 10.0, 1.0)
+        counts = np.bincount(px, minlength=10)
+        dom = counts.max() / len(px)
+        balance = 1.0 - dom
         return 0.7 * diversity + 0.3 * balance
     except:
         return 0.0
 
-def row_consistency(output):
+def row_consistency(s):
     try:
-        data = json.loads(output)
-        grid = data.get("grid", [])
-
-        if not grid:
-            return 0.0
-
+        d = json.loads(s)
+        g = d.get("grid", [])
+        if not g: return 0.0
         changes, total = 0, 0
-
-        for row in grid:
-            for i in range(len(row) - 1):
+        for r in g:
+            for i in range(len(r)-1):
                 total += 1
-                if row[i] != row[i+1]:
-                    changes += 1
-
+                if r[i] != r[i+1]: changes += 1
         return 1.0 - (changes / total)
     except:
         return 0.0
 
-# ==========================================
-# 5. Evaluate (PAIRWISE)
-# ==========================================
+# -------------------------------
+# Evaluate
+# -------------------------------
 rows = []
+for i, ex in enumerate(tqdm(dataset)):
+    base_js, base_raw = generate(base_model, ex)
+    lora_js, lora_raw = generate(lora_model, ex)
 
-for idx, sample in enumerate(tqdm(dataset)):
-    prompt = build_prompt(sample)
+    if i < 2:
+        print("\n=== DEBUG ===")
+        print("BASE RAW:\n", base_raw[:300])
+        print("BASE JSON:\n", base_js)
+        print("LORA RAW:\n", lora_raw[:300])
+        print("LORA JSON:\n", lora_js)
 
-    base_out = generate(base_model, prompt)
-    lora_out = generate(lora_model, prompt)
-
-    base_metrics = {
-        "json": json_validity(base_out),
-        "render": render_success(base_out),
-        "quality": pixel_art_quality(base_out),
-        "consistency": row_consistency(base_out),
+    bm = {
+        "json": json_validity(base_js),
+        "render": render_success(base_js),
+        "quality": pixel_art_quality(base_js),
+        "consistency": row_consistency(base_js),
+    }
+    lm = {
+        "json": json_validity(lora_js),
+        "render": render_success(lora_js),
+        "quality": pixel_art_quality(lora_js),
+        "consistency": row_consistency(lora_js),
     }
 
-    lora_metrics = {
-        "json": json_validity(lora_out),
-        "render": render_success(lora_out),
-        "quality": pixel_art_quality(lora_out),
-        "consistency": row_consistency(lora_out),
-    }
+    rows.append({
+        "id": i,
+        "example_name": ex["example_name"],
+        **{f"base_{k}": v for k, v in bm.items()},
+        **{f"lora_{k}": v for k, v in lm.items()},
+        "delta_quality": lm["quality"] - bm["quality"],
+        "delta_consistency": lm["consistency"] - bm["consistency"],
+        "lora_win": int(lm["quality"] > bm["quality"]),
+    })
 
-    row = {
-        "id": idx,
-        "example_name": sample["example_name"],
-
-        # base
-        "base_json": base_metrics["json"],
-        "base_render": base_metrics["render"],
-        "base_quality": base_metrics["quality"],
-        "base_consistency": base_metrics["consistency"],
-
-        # lora
-        "lora_json": lora_metrics["json"],
-        "lora_render": lora_metrics["render"],
-        "lora_quality": lora_metrics["quality"],
-        "lora_consistency": lora_metrics["consistency"],
-
-        # deltas
-        "delta_quality": lora_metrics["quality"] - base_metrics["quality"],
-        "delta_consistency": lora_metrics["consistency"] - base_metrics["consistency"],
-
-        # win signal
-        "lora_win": int(lora_metrics["quality"] > base_metrics["quality"]),
-    }
-
-    rows.append(row)
-
-# ==========================================
-# 6. Save CSV
-# ==========================================
 df = pd.DataFrame(rows)
 df.to_csv("lora_vs_base_eval.csv", index=False)
 
-# ==========================================
-# 7. Summary (console)
-# ==========================================
 summary = {
     "base_quality_mean": df["base_quality"].mean(),
     "lora_quality_mean": df["lora_quality"].mean(),
     "quality_gain": df["delta_quality"].mean(),
     "lora_win_rate": df["lora_win"].mean(),
     "render_success_gain": df["lora_render"].mean() - df["base_render"].mean(),
+    "json_validity_gain": df["lora_json"].mean() - df["base_json"].mean(),
 }
-
 print("\n=== SUMMARY ===")
 for k, v in summary.items():
     print(f"{k}: {v:.4f}")

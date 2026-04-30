@@ -12,6 +12,12 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
+import torch.nn.functional as F
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 # ==========================================
 # 1. Config
 # ==========================================
@@ -26,17 +32,17 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     device_map="auto"
 )
 
 # ==========================================
-# 3. LoRA
+# 3. LoRA + Compile
 # ==========================================
 lora_config = LoraConfig(
     r=16,
     lora_alpha=32,
-    target_modules=["q_proj", "v_proj","k_proj"],
+    target_modules=["q_proj", "k_proj", "v_proj"],
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
@@ -44,46 +50,25 @@ lora_config = LoraConfig(
 
 model = get_peft_model(model, lora_config)
 
-model = torch.compile(
-    model,
-    mode="reduce-overhead",  # best for training
-    fullgraph=False          # REQUIRED (dynamic shapes)
-)
 
 # ==========================================
 # 4. Load dataset
 # ==========================================
 dataset = load_dataset(DATASET_NAME)
 
-# ==========================================
-# 5. Compute class weights (0–9 digits)
-# ==========================================
-def compute_class_weights(ds):
-    counter = Counter()
+# ✅ NEW: Keep only relevant columns
+keep_cols = ["example_name", "palette", "grid", "is_appropriate"]
 
-    for ex in ds:
-        for row in ex["grid"]:
-            for ch in row:
-                counter[int(ch)] += 1
+dataset = dataset["train"].remove_columns(
+    [col for col in dataset["train"].column_names if col not in keep_cols]
+)
 
-    total = sum(counter.values())
-    freqs = np.array([counter[i] for i in range(10)]) / total
-
-    weights = 1.0 / (freqs + 1e-8)
-    weights = weights / weights.mean()
-
-    return torch.tensor(weights, dtype=torch.float32)
-
-class_weights = compute_class_weights(dataset["train"])
+# ✅ OPTIONAL: filter bad samples
+dataset = dataset.filter(lambda x: x["is_appropriate"] is True)
 
 # ==========================================
-# 6. Prompt formatting
+# 5. Prompt formatting
 # ==========================================
-SYSTEM_PROMPT = """Draw pixel art on a 24x24 grid. Return JSON with:
-- palette: list of hex colors (no #)
-- grid: 24 strings of length 24 (digits 0-9)
-Output ONLY JSON."""
-
 def format_example(example):
     prompt = f"Draw: {example['example_name']}"
 
@@ -102,7 +87,7 @@ def format_example(example):
 dataset = dataset.map(format_example)
 
 # ==========================================
-# 7. Tokenization + masking
+# 6. Tokenization + masking (CLEAN VERSION)
 # ==========================================
 assistant_token = tokenizer.encode(
     "<|im_start|>assistant", add_special_tokens=False
@@ -116,48 +101,75 @@ def tokenize(example):
         max_length=MAX_LENGTH
     )
 
-    labels = enc["input_ids"].copy()
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
 
-    # find assistant start
+    labels = input_ids.copy()
+
     try:
-        start_idx = labels.index(assistant_token)
+        start_idx = input_ids.index(assistant_token)
     except ValueError:
-        start_idx = len(labels)
+        start_idx = len(input_ids)
 
-    # mask everything before assistant response
     labels[:start_idx] = [-100] * start_idx
 
-    enc["labels"] = labels
-    return enc
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels
+    }
 
-tokenized_dataset = dataset.map(tokenize, batched=False)
-
-# ==========================================
-# 8. Digit token mapping (robust)
-# ==========================================
-digit_token_ids = {
-    tokenizer.encode(str(i), add_special_tokens=False)[0]: i
-    for i in range(10)
-}
-
-digit_token_id_list = list(digit_token_ids.keys())
+# ✅ CRITICAL FIX: remove all old columns here
+tokenized_dataset = dataset.map(
+    tokenize,
+    batched=False,
+    remove_columns=dataset.column_names
+)
 
 # ==========================================
-# 9. Custom Trainer with weighted loss
+# 7. Token-level weight computation
 # ==========================================
-import torch.nn.functional as F
+def compute_token_weights(tokenized_ds, tokenizer,model):
+    counter = Counter()
 
+    for ex in tokenized_ds:
+        for token in ex["input_ids"]:
+            if token != tokenizer.pad_token_id:
+                counter[token] += 1
+
+    total = sum(counter.values())
+    vocab_size = model.config.vocab_size 
+
+    weights = torch.ones(vocab_size)
+
+    for token, count in counter.items():
+        freq = count / total
+        weights[token] = 1.0 / (freq + 1e-8)
+
+    weights = weights / weights.mean()
+    return weights
+
+token_weights = compute_token_weights(
+    tokenized_dataset,
+    tokenizer,
+    model
+)
+
+# ==========================================
+# 8. Custom Trainer (token-weighted CE)
+# ==========================================
 class WeightedLossTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs["labels"]
+
         outputs = model(**inputs)
         logits = outputs.logits
 
-        # shift
+        # Shift for causal LM
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
@@ -166,31 +178,25 @@ class WeightedLossTrainer(Trainer):
         shift_logits = shift_logits.view(-1, vocab_size)
         shift_labels = shift_labels.view(-1)
 
-        # map tokens → digits
-        mapped_labels = torch.full_like(shift_labels, -100)
-
-        for token_id, digit in digit_token_ids.items():
-            mapped_labels[shift_labels == token_id] = digit
-
-        valid_mask = mapped_labels != -100
-
-        if valid_mask.sum() == 0:
-            return torch.tensor(0.0, requires_grad=True).to(logits.device)
-
-        logits = shift_logits[valid_mask][:, digit_token_id_list]
-        labels = mapped_labels[valid_mask]
-
         loss = F.cross_entropy(
-            logits,
-            labels,
-            weight=self.class_weights.to(logits.device)
+            shift_logits,
+            shift_labels,
+            weight=self.class_weights.to(shift_logits.device),
+            ignore_index=-100
         )
 
-        # logging
+        # Logging (dominance check)
         if self.state.global_step % 10 == 0:
             with torch.no_grad():
-                preds = logits.argmax(dim=-1)
-                dominant_ratio = (preds == preds.mode()[0]).float().mean()
+                valid = shift_labels != -100
+                preds = shift_logits.argmax(dim=-1)
+
+                if valid.sum() > 0:
+                    dominant_ratio = (
+                        preds[valid] == preds[valid].mode()[0]
+                    ).float().mean()
+                else:
+                    dominant_ratio = torch.tensor(0.0)
 
             self.log({
                 "train_loss": loss.item(),
@@ -200,7 +206,7 @@ class WeightedLossTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 # ==========================================
-# 10. Training args
+# 9. Training args
 # ==========================================
 training_args = TrainingArguments(
     output_dir="./qwen-pixel-art",
@@ -215,26 +221,27 @@ training_args = TrainingArguments(
     lr_scheduler_type="cosine",
     warmup_ratio=0.03,
     report_to="tensorboard",
+    remove_unused_columns=False,
     logging_dir="./logs"
 )
 
 # ==========================================
-# 11. Trainer
+# 10. Trainer
 # ==========================================
 trainer = WeightedLossTrainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_dataset["train"],
-    class_weights=class_weights,
+    train_dataset=tokenized_dataset,
+    class_weights=token_weights,
 )
 
 # ==========================================
-# 12. Train
+# 11. Train
 # ==========================================
 trainer.train()
 
 # ==========================================
-# 13. Save
+# 12. Save
 # ==========================================
 model.save_pretrained("./qwen-pixel-art-lora")
 tokenizer.save_pretrained("./qwen-pixel-art-lora")
