@@ -1,0 +1,11 @@
+id,example_name,base_json,base_render,base_quality,base_consistency,lora_json,lora_render,lora_quality,lora_consistency,delta_quality,delta_consistency,lora_win
+0,Mario from Super Mario Bros,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+1,The planet Saturn with its rings,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+2,"A maze, entrance at top left, exit bottom right",0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+3,The Mona Lisa,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+4,Hope,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+5,The sun,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+6,The planet Saturn with its rings,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+7,Mario from Super Mario Bros,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+8,The planet Saturn with its rings,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
+9,"A maze, entrance at top left, exit bottom right",0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0
