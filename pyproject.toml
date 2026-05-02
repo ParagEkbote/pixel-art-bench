@@ -19,7 +19,12 @@ dependencies = [
     "transformers",
     "accelerate",
     "pyyaml",
-    "matplotlib"
+    "numpy",
+    "datasets",
+    "torch",
+    "seaborn",
+    "matplotlib",
+    "pandas"
 ]
 
 # Optional extras for dev / experimentation
